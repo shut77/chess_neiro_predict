@@ -63,35 +63,44 @@ class ChessResidualBlock(nn.Module):
     
     def forward(self, x):
         residual = x
-        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.gelu(self.bn1(self.conv1(x)))
         x = self.bn2(self.conv2(x))
         x += residual
-        return F.relu(x)
+        return F.gelu(x)
 
 class ChessMovePredictor(nn.Module):
     def __init__(self, num_moves=4672, num_residual_blocks=5, channels=256):
         super().__init__()
         self.num_moves = num_moves
         
-        self.conv_input = nn.Conv2d(12, channels, 3, padding=1)
+        self.conv_input = nn.Conv2d(15, channels, 5, padding=2)
         self.bn_input = nn.BatchNorm2d(channels)
         
         self.res_blocks = nn.Sequential(
             *[ChessResidualBlock(channels) for _ in range(num_residual_blocks)])
         
-        self.global_pool = nn.AdaptiveAvgPool2d(1)  # [batch, 256, 8, 8] в [batch, 256, 1, 1]
+        self.final_conv = nn.Conv2d(channels, channels, 3, padding=2, dilation=2)
+        self.final_norm = nn.BatchNorm2d(channels)
+
+        self.smaller_layer = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, stride=2, padding=1),  # 8x8 -> 4x4
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 3, stride=2, padding=1),  # 4x4 -> 2x2 
+            nn.GELU())
+        
+        #self.global_pool = nn.AdaptiveAvgPool2d(1)  # [batch, 256, 8, 8] в [batch, 256, 1, 1]
         
         self.add_fc = nn.Sequential(
-            nn.Linear(17, 128),
-            nn.ReLU(),
+            nn.Linear(23, 128),
+            nn.GELU(),
             nn.Dropout(0.2))
-        
+        after_small_layer = channels *2 *2 
         # Объединение признаков CNN и доп
         self.combined_fc = nn.Sequential(
-            nn.Linear(channels + 128, 512),
-            nn.ReLU(),
+            nn.Linear(after_small_layer + 128, 1024),
+            nn.GELU(),
             nn.Dropout(0.2),
-            nn.Linear(512, num_moves))
+            nn.Linear(1024, num_moves))
     
     def forward(self, board_tensor, add_features, legal_moves_mask):
         """
@@ -105,10 +114,13 @@ class ChessMovePredictor(nn.Module):
         """
         batch_size = board_tensor.size(0)
         
-        x = F.relu(self.bn_input(self.conv_input(board_tensor)))  # [batch, 256, 8, 8]
+        x = F.gelu(self.bn_input(self.conv_input(board_tensor)))  # [batch, 256, 8, 8]
         x = self.res_blocks(x)  # [batch, 256, 8, 8]
-        
-        x = self.global_pool(x)  # [batch, 256, 1, 1]
+        x = self.final_conv(x)
+        x = self.final_norm(x)
+
+        #x = self.global_pool(x)  # [batch, 256, 1, 1]
+        x = self.smaller_layer(x)
         x = x.view(batch_size, -1)  # [batch, 256]
         
         add_features = self.add_fc(add_features)  # [batch, 128]
