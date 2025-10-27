@@ -53,84 +53,125 @@ class ChessDataset(Dataset):
 
         return neiro_input(fen, move_uci, self.all_moves, self.move_to_index)
 
+class SEBlock1(nn.Module):
+    def __init__(self, channels, reduction=32):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction),
+            nn.ReLU(),
+            nn.Linear(channels // reduction, channels),
+            nn.Sigmoid())
+    
+    def forward(self, x):
+        b, c, _, _ = x.shape
+        y = F.adaptive_avg_pool2d(x, 1).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=32):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.SiLU(),  # Swish активация
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        scale = self.fc(x).view(x.size(0), x.size(1), 1, 1)
+        return x * scale
+    
+
 class ChessResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.bn2 = nn.BatchNorm2d(channels)
-    
+        self.bn1 = nn.BatchNorm2d(channels) #nn. GroupNorm(4, channels)
+        self.bn2 = nn.BatchNorm2d(channels) #nn. GroupNorm(4, channels)
+        self.se = SEBlock(channels)
+        
     def forward(self, x):
         residual = x
         x = F.gelu(self.bn1(self.conv1(x)))
-        x = self.bn2(self.conv2(x))
+        x = F.gelu(self.bn2(self.conv2(x))) 
+        x = self.se(x)  
         x += residual
         return F.gelu(x)
 
+
 class ChessMovePredictor(nn.Module):
-    def __init__(self, num_moves=4672, num_residual_blocks=5, channels=256):
+    def __init__(self, num_moves=4672, num_residual_blocks=10, channels=256):
         super().__init__()
         self.num_moves = num_moves
         
         self.conv_input = nn.Conv2d(15, channels, 5, padding=2)
-        self.bn_input = nn.BatchNorm2d(channels)
+        self.bn_input = nn.BatchNorm2d(channels) #nn. GroupNorm(4, channels)
+        
         
         self.res_blocks = nn.Sequential(
             *[ChessResidualBlock(channels) for _ in range(num_residual_blocks)])
-        
-        self.final_conv = nn.Conv2d(channels, channels, 3, padding=2, dilation=2)
-        self.final_norm = nn.BatchNorm2d(channels)
 
-        self.smaller_layer = nn.Sequential(
+        self.dilated_conv = nn.Conv2d(channels, channels, 3, padding=2, dilation=2)
+        self.dilated_norm = nn.BatchNorm2d(channels) #nn. GroupNorm(4, channels)
+        
+        self.se = SEBlock(channels)
+        self.input_se = SEBlock(channels) 
+        
+        self.spatial_reduce = nn.Sequential(
             nn.Conv2d(channels, channels, 3, stride=2, padding=1),  # 8x8 -> 4x4
-            nn.GELU(),
-            nn.Conv2d(channels, channels, 3, stride=2, padding=1),  # 4x4 -> 2x2 
             nn.GELU())
-        
-        #self.global_pool = nn.AdaptiveAvgPool2d(1)  # [batch, 256, 8, 8] в [batch, 256, 1, 1]
-        
+
         self.add_fc = nn.Sequential(
-            nn.Linear(23, 128),
-            nn.GELU(),
-            nn.Dropout(0.2))
-        after_small_layer = channels *2 *2 
-        # Объединение признаков CNN и доп
-        self.combined_fc = nn.Sequential(
-            nn.Linear(after_small_layer + 128, 1024),
+            nn.Linear(23, 256),
             nn.GELU(),
             nn.Dropout(0.2),
-            nn.Linear(1024, num_moves))
+            
+        )
+        spatial_features = channels * 4 * 4 
+        self.combined_fc = nn.Sequential(
+            nn.Linear(spatial_features + 256, 1024),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(1024, num_moves)  
+        )
     
-    def forward(self, board_tensor, add_features, legal_moves_mask):
+    def forward(self, board_tensor, additional_features, legal_moves_mask):
         """
-            board_tensor: [batch, 12, 8, 8]
-            add_features: [batch, 17]
+        Args:
+            board_tensor: [batch, 15, 8, 8]
+            additional_features: [batch, 23]
             legal_moves_mask: [batch, num_moves] - маска легальных ходов
         
-        returns:
+        Returns:
             move_probs: [batch, num_moves] - вероятности ходов
             move_logits: [batch, num_moves] - логиты (для loss)
         """
         batch_size = board_tensor.size(0)
         
-        x = F.gelu(self.bn_input(self.conv_input(board_tensor)))  # [batch, 256, 8, 8]
-        x = self.res_blocks(x)  # [batch, 256, 8, 8]
-        x = self.final_conv(x)
-        x = self.final_norm(x)
-
-        #x = self.global_pool(x)  # [batch, 256, 1, 1]
-        x = self.smaller_layer(x)
-        x = x.view(batch_size, -1)  # [batch, 256]
         
-        add_features = self.add_fc(add_features)  # [batch, 128]
+        x = F.gelu(self.bn_input(self.conv_input(board_tensor)))  # [batch, 256, 8, 8]
+        x = self.input_se(x)
+        x = self.res_blocks(x)  # [batch, 256, 8, 8]
+        x = self.dilated_conv(x)
+        x = self.dilated_norm(x)
+        x = F.gelu(x) 
+        x = self.se(x)
+        
+        x = self.spatial_reduce(x) 
+
+        x = x.view(batch_size, -1)  # [batch, 256]
+        add_features = self.add_fc(additional_features)  # [batch, 128]
         combined = torch.cat([x, add_features], dim=1)  # [batch, 384]
         
         # предикт всех ходов
         move_logits = self.combined_fc(combined)  # [batch, num_moves]
         
         # маска легал ходов
-        move_logits = move_logits.masked_fill(~legal_moves_mask, -1e9)
+        move_logits = move_logits.masked_fill(~legal_moves_mask, -1e9) # -1e9
         
         # Softmax по легальным ходам
         move_probs = F.softmax(move_logits, dim=-1)
